@@ -1,0 +1,100 @@
+name: Setup Main Branch Ruleset
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  administration: write
+
+jobs:
+  setup-ruleset:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create main branch if it does not exist
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+
+            const { data: branches } = await github.rest.repos.listBranches({ owner, repo });
+            const mainExists = branches.some(b => b.name === 'main');
+
+            if (!mainExists) {
+              const { data: repoInfo } = await github.rest.repos.get({ owner, repo });
+              const { data: ref } = await github.rest.git.getRef({
+                owner,
+                repo,
+                ref: `heads/${repoInfo.default_branch}`,
+              });
+              await github.rest.git.createRef({
+                owner,
+                repo,
+                ref: 'refs/heads/main',
+                sha: ref.object.sha,
+              });
+              console.log('Created main branch from ' + repoInfo.default_branch);
+            } else {
+              console.log('main branch already exists');
+            }
+
+      - name: Create or update main branch ruleset
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const RULESET_NAME = 'main-branch-ruleset';
+
+            // Remove existing ruleset with the same name to allow idempotent re-runs
+            const { data: existingRulesets } = await github.rest.repos.getRepoRulesets({ owner, repo });
+            for (const rs of existingRulesets) {
+              if (rs.name === RULESET_NAME) {
+                await github.rest.repos.deleteRepoRuleset({
+                  owner,
+                  repo,
+                  ruleset_id: rs.id,
+                });
+                console.log(`Deleted existing ruleset: ${rs.id}`);
+              }
+            }
+
+            // RepositoryRole actor_id mapping:
+            //   1 = Read | 2 = Write | 4 = Maintain | 5 = Admin
+            const { data: ruleset } = await github.rest.repos.createRepoRuleset({
+              owner,
+              repo,
+              name: RULESET_NAME,
+              target: 'branch',
+              enforcement: 'active',
+              conditions: {
+                ref_name: {
+                  include: ['refs/heads/main'],
+                  exclude: [],
+                },
+              },
+              // Only repository admins can bypass the ruleset (i.e. merge without PR approval)
+              bypass_actors: [
+                {
+                  actor_id: 5,           // Admin role
+                  actor_type: 'RepositoryRole',
+                  bypass_mode: 'always',
+                },
+              ],
+              rules: [
+                {
+                  type: 'pull_request',
+                  parameters: {
+                    // Require at least one approving review before merge
+                    required_approving_review_count: 1,
+                    // Automatically request a Copilot code review on every PR
+                    automatic_copilot_code_review_enabled: true,
+                    dismiss_stale_reviews_on_push: true,
+                    require_code_owner_review: false,
+                    require_last_push_approval: false,
+                    required_review_thread_resolution: false,
+                  },
+                },
+              ],
+            });
+
+            console.log(`Ruleset created successfully: id=${ruleset.id}, name=${ruleset.name}`);
